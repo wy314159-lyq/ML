@@ -133,7 +133,7 @@ class Plotter:
             bool: True if the user clicks "OK", False otherwise.
         """
         dialog = ComparisonDialog()
-        dialog.setWindowTitle(f"'{column_name}' | Outlier Handling Comparison")
+        dialog.setWindowTitle(f"'{column_name}' | Before vs. After")
 
         # Plot "Before"
         dialog.before_canvas.axes.set_title(f"Before (Original)")
@@ -141,7 +141,7 @@ class Plotter:
         dialog.before_canvas.draw()
         
         # Plot "After"
-        dialog.after_canvas.axes.set_title(f"After (Capped)")
+        dialog.after_canvas.axes.set_title(f"After (Transformed)")
         sns.histplot(after_series, ax=dialog.after_canvas.axes, kde=True)
         dialog.after_canvas.draw()
         

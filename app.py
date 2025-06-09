@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QLabel, QComboBox, QLineEdit,
                              QMessageBox, QListWidget, QListWidgetItem,
                              QAbstractItemView, QTextEdit, QDoubleSpinBox, QSpinBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt5.QtGui import QStandardItemModel, QStandardItem
 from data_handler import load_dataframe
 from visualization import Plotter
@@ -12,6 +12,33 @@ from mpl_canvas import MplCanvas
 from dialogs import ComparisonDialog
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, OneHotEncoder, OrdinalEncoder, KBinsDiscretizer
+import webbrowser
+import os
+from ydata_profiling import ProfileReport
+from category_encoders import TargetEncoder
+
+# --- Worker for background tasks ---
+class ProfileWorker(QObject):
+    """
+    A worker to generate the ydata-profiling report in a separate thread.
+    """
+    finished = pyqtSignal(str)  # Signal to emit the report file path when done
+    error = pyqtSignal(str)     # Signal to emit error messages
+
+    def __init__(self, df):
+        super().__init__()
+        self.df = df
+
+    def run(self):
+        try:
+            profile = ProfileReport(self.df, title="Data Analysis Report")
+            # Save to a temporary file
+            report_path = os.path.join(os.path.dirname(__file__), "data_report.html")
+            profile.to_file(report_path)
+            self.finished.emit(report_path)
+        except Exception as e:
+            self.error.emit(str(e))
 
 def set_dark_style(app):
     style_sheet = """
@@ -121,6 +148,7 @@ class MainWindow(QMainWindow):
         self.X = None
         self.y = None
         self.operation_history = []
+        self.thread = None # For managing background tasks
 
         self._init_ui()
 
@@ -144,6 +172,7 @@ class MainWindow(QMainWindow):
         columns_layout = QVBoxLayout()
         self.column_list_widget = QListWidget()
         self.column_list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.column_list_widget.itemSelectionChanged.connect(self.on_column_selection_changed)
         columns_layout.addWidget(self.column_list_widget)
         columns_group.setLayout(columns_layout)
         left_layout.addWidget(columns_group)
@@ -174,6 +203,12 @@ class MainWindow(QMainWindow):
         # EDA -> Data Summary
         summary_group = QGroupBox("Data Summary")
         summary_layout = QVBoxLayout()
+        
+        # --- Profiling Report Button ---
+        self.btn_generate_report = QPushButton("Generate Detailed Analysis Report")
+        self.btn_generate_report.clicked.connect(self.generate_profile_report)
+        summary_layout.addWidget(self.btn_generate_report)
+
         self.info_text = QTextEdit()
         self.info_text.setReadOnly(True)
         self.describe_table = QTableView()
@@ -361,6 +396,9 @@ class MainWindow(QMainWindow):
         # --- Outlier Handling ---
         outlier_group = QGroupBox("Outlier Handling")
         outlier_layout = QVBoxLayout()
+        self.outlier_suggestion_label = QLabel("Suggestion: Select a numeric column to see recommendations.")
+        self.outlier_suggestion_label.setStyleSheet("font-style: italic; color: #CCCCCC;")
+        outlier_layout.addWidget(self.outlier_suggestion_label)
         outlier_layout.addWidget(QLabel("Select numeric columns from the list on the left to handle outliers."))
         
         outlier_controls_layout = QHBoxLayout()
@@ -384,6 +422,63 @@ class MainWindow(QMainWindow):
         
         outlier_group.setLayout(outlier_layout)
         preprocess_layout.addWidget(outlier_group)
+
+        # --- Feature Scaling ---
+        scaling_group = QGroupBox("Feature Scaling")
+        scaling_layout = QVBoxLayout()
+        scaling_layout.addWidget(QLabel("Select numeric columns from the list on the left to scale."))
+        scaling_form_layout = QHBoxLayout()
+        scaling_form_layout.addWidget(QLabel("Method:"))
+        self.scaling_method_selector = QComboBox()
+        self.scaling_method_selector.addItems(["StandardScaler", "MinMaxScaler", "RobustScaler"])
+        scaling_form_layout.addWidget(self.scaling_method_selector)
+        self.btn_apply_scaling = QPushButton("Apply Scaling")
+        self.btn_apply_scaling.clicked.connect(self.apply_scaling)
+        scaling_form_layout.addWidget(self.btn_apply_scaling)
+        scaling_layout.addLayout(scaling_form_layout)
+        scaling_group.setLayout(scaling_layout)
+        preprocess_layout.addWidget(scaling_group)
+
+        # --- Categorical Encoding ---
+        encoding_group = QGroupBox("Categorical Encoding")
+        encoding_layout = QVBoxLayout()
+        encoding_layout.addWidget(QLabel("Select categorical columns from the list on the left to encode."))
+        encoding_form_layout = QHBoxLayout()
+        encoding_form_layout.addWidget(QLabel("Method:"))
+        self.encoding_method_selector = QComboBox()
+        self.encoding_method_selector.addItems(["OneHotEncoder", "OrdinalEncoder", "TargetEncoder"])
+        encoding_form_layout.addWidget(self.encoding_method_selector)
+        self.btn_apply_encoding = QPushButton("Apply Encoding")
+        self.btn_apply_encoding.clicked.connect(self.apply_encoding)
+        encoding_form_layout.addWidget(self.btn_apply_encoding)
+        encoding_layout.addLayout(encoding_form_layout)
+        encoding_group.setLayout(encoding_layout)
+        preprocess_layout.addWidget(encoding_group)
+
+        # --- Data Binning ---
+        binning_group = QGroupBox("Data Binning (Discretization)")
+        binning_layout = QVBoxLayout()
+        binning_layout.addWidget(QLabel("Select numeric columns to convert to intervals. New columns will be created and originals removed."))
+        
+        binning_form_layout = QHBoxLayout()
+        binning_form_layout.addWidget(QLabel("Number of Bins:"))
+        self.n_bins_spinbox = QSpinBox()
+        self.n_bins_spinbox.setMinimum(2)
+        self.n_bins_spinbox.setValue(5)
+        binning_form_layout.addWidget(self.n_bins_spinbox)
+        
+        binning_form_layout.addWidget(QLabel("Strategy:"))
+        self.binning_strategy_selector = QComboBox()
+        self.binning_strategy_selector.addItems(["Quantile (Equal Frequency)", "Uniform (Equal Width)", "KMeans"])
+        binning_form_layout.addWidget(self.binning_strategy_selector)
+        
+        self.btn_apply_binning = QPushButton("Apply Binning")
+        self.btn_apply_binning.clicked.connect(self.apply_binning)
+        binning_form_layout.addWidget(self.btn_apply_binning)
+        
+        binning_layout.addLayout(binning_form_layout)
+        binning_group.setLayout(binning_layout)
+        preprocess_layout.addWidget(binning_group)
 
         # --- Pipeline Persistence ---
         pipeline_group = QGroupBox("Preprocessing Pipeline")
@@ -935,8 +1030,81 @@ class MainWindow(QMainWindow):
             self.operation_history.append({'name': 'delete_columns', 'columns': operation['columns']})
             self.df = self.df.drop(columns=operation['columns'])
         
-        # REMOVED: Redundant logging. The operation is now logged before it's executed.
-        # self.operation_history.append(operation)
+        elif op_name == 'apply_scaling':
+            columns = operation.get('columns', [])
+            method = operation.get('method')
+            if not method or not columns: return
+            
+            scaler_map = {"StandardScaler": StandardScaler(), "MinMaxScaler": MinMaxScaler(), "RobustScaler": RobustScaler()}
+            scaler = scaler_map.get(method)
+            if not scaler: return
+
+            valid_columns = [col for col in columns if col in self.df.columns]
+            if valid_columns:
+                self.df[valid_columns] = scaler.fit_transform(self.df[valid_columns])
+
+        elif op_name == 'apply_encoding':
+            columns = operation.get('columns', [])
+            method = operation.get('method')
+            if not columns or not method: return
+
+            valid_columns = [col for col in columns if col in self.df.columns]
+            if not valid_columns: return
+
+            if method == "OneHotEncoder":
+                encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                encoded_data = encoder.fit_transform(self.df[valid_columns])
+                new_col_names = encoder.get_feature_names_out(valid_columns)
+                encoded_df = pd.DataFrame(encoded_data, columns=new_col_names, index=self.df.index)
+                self.df = self.df.drop(columns=valid_columns)
+                self.df = pd.concat([self.df, encoded_df], axis=1)
+
+            elif method == "OrdinalEncoder":
+                encoder = OrdinalEncoder()
+                self.df[valid_columns] = encoder.fit_transform(self.df[valid_columns])
+
+            elif method == "TargetEncoder":
+                if self.y is None:
+                    print("Warning: Target column not set. Skipping TargetEncoder during pipeline execution.")
+                    return
+                
+                target_name = self.y.name
+                if target_name not in self.df.columns:
+                    print(f"Warning: Target column '{target_name}' not found. Skipping TargetEncoder step.")
+                    return
+
+                y_series = self.df[target_name]
+                X_cols = [col for col in valid_columns if col != target_name]
+                if not X_cols:
+                    return
+                
+                encoder = TargetEncoder(cols=X_cols)
+                self.df[X_cols] = encoder.fit_transform(self.df[X_cols], y_series)
+
+        elif op_name == 'apply_binning':
+            columns = operation.get('columns', [])
+            n_bins = operation.get('n_bins', 5)
+            strategy = operation.get('strategy', 'quantile')
+
+            valid_columns = [col for col in columns if col in self.df.columns]
+            if not valid_columns:
+                return
+
+            for col in valid_columns:
+                try:
+                    discretizer = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy=strategy)
+                    # KBinsDiscretizer expects 2D array, so we reshape
+                    binned_data = discretizer.fit_transform(self.df[[col]])
+                    
+                    # Create a new column for the binned data
+                    new_col_name = f"{col}_binned"
+                    self.df[new_col_name] = binned_data.astype(int)
+                
+                except Exception:
+                    # If binning fails for one column, skip it and continue
+                    continue
+            
+            self.df = self.df.drop(columns=valid_columns, errors='ignore')
 
     def export_processed_data(self):
         if self.X is None or self.y is None:
@@ -1081,3 +1249,317 @@ class MainWindow(QMainWindow):
         self.update_data_preview()
         self.update_eda_info()
         self.update_vis_selectors() 
+
+    def apply_encoding(self):
+        if self.df is None:
+            return
+
+        selected_items = self.column_list_widget.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select one or more columns for encoding.")
+            return
+
+        selected_columns = [item.text() for item in selected_items]
+        method = self.encoding_method_selector.currentText()
+
+        if method == "OneHotEncoder":
+            encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            encoded_data = encoder.fit_transform(self.df[selected_columns])
+            new_col_names = encoder.get_feature_names_out(selected_columns)
+            encoded_df = pd.DataFrame(encoded_data, columns=new_col_names, index=self.df.index)
+            self.df = self.df.drop(columns=selected_columns)
+            self.df = pd.concat([self.df, encoded_df], axis=1)
+            QMessageBox.information(self, "Success", f"OneHotEncoder applied. Original columns removed and {len(new_col_names)} new columns added.")
+
+        elif method == "OrdinalEncoder":
+            encoder = OrdinalEncoder()
+            self.df[selected_columns] = encoder.fit_transform(self.df[selected_columns])
+            QMessageBox.information(self, "Success", "OrdinalEncoder applied to selected columns.")
+
+        elif method == "TargetEncoder":
+            if self.y is None:
+                QMessageBox.critical(self, "Error", "Target variable (y) is not set.\nPlease go to the 'Feature & Target' tab to select a target before using TargetEncoder.")
+                return
+            
+            target_name = self.y.name
+            if target_name in selected_columns:
+                QMessageBox.warning(self, "Warning", f"The target column '{target_name}' cannot be used as a feature for Target Encoding. It will be ignored.")
+                selected_columns.remove(target_name)
+                if not selected_columns:
+                    return
+
+            encoder = TargetEncoder(cols=selected_columns)
+            self.df[selected_columns] = encoder.fit_transform(self.df[selected_columns], self.y)
+            QMessageBox.information(self, "Success", "TargetEncoder applied to selected columns.")
+
+        self.operation_history.append({
+            'name': 'apply_encoding',
+            'columns': selected_columns,
+            'method': method
+        })
+        
+        self.update_data_preview()
+        self.update_eda_info()
+        self.update_vis_selectors()
+        self.update_column_list()
+
+    def apply_binning(self):
+        if self.df is None:
+            return
+
+        selected_items = self.column_list_widget.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select one or more numeric columns for binning.")
+            return
+
+        selected_columns = [item.text() for item in selected_items]
+        
+        # Filter for numeric columns
+        numeric_cols = self.df[selected_columns].select_dtypes(include=np.number).columns.tolist()
+        non_numeric_cols = list(set(selected_columns) - set(numeric_cols))
+
+        if not numeric_cols:
+            QMessageBox.warning(self, "Warning", "Binning can only be applied to numeric columns.")
+            return
+        
+        if non_numeric_cols:
+            QMessageBox.information(self, "Info", f"Binning will only be applied to the following numeric columns:\n\n{', '.join(numeric_cols)}")
+
+        n_bins = self.n_bins_spinbox.value()
+        strategy_map = {
+            "Quantile (Equal Frequency)": "quantile",
+            "Uniform (Equal Width)": "uniform",
+            "KMeans": "kmeans"
+        }
+        strategy = strategy_map[self.binning_strategy_selector.currentText()]
+
+        try:
+            # We will create new columns and drop the old ones
+            for col in numeric_cols:
+                discretizer = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy=strategy)
+                # KBinsDiscretizer expects 2D array, so we reshape
+                binned_data = discretizer.fit_transform(self.df[[col]])
+                
+                # Create a new column for the binned data
+                new_col_name = f"{col}_binned"
+                self.df[new_col_name] = binned_data.astype(int)
+            
+            # Drop original columns after processing all selected ones
+            self.df = self.df.drop(columns=numeric_cols)
+
+            # Log operation
+            self.operation_history.append({
+                'name': 'apply_binning',
+                'columns': numeric_cols,
+                'n_bins': n_bins,
+                'strategy': strategy
+            })
+
+            QMessageBox.information(self, "Success", f"Binning applied to {len(numeric_cols)} columns. Original columns removed.")
+            
+            # Refresh all views
+            self.update_data_preview()
+            self.update_eda_info()
+            self.update_vis_selectors()
+            self.update_column_list()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to apply binning.\nError: {e}") 
+
+    def generate_profile_report(self):
+        if self.df is None:
+            QMessageBox.warning(self, "Warning", "Please load data first.")
+            return
+
+        # Disable the button to prevent multiple clicks
+        self.btn_generate_report.setEnabled(False)
+        self.btn_generate_report.setText("Generating Report...")
+
+        # Create worker and thread
+        self.thread = QThread()
+        self.worker = ProfileWorker(self.df.copy()) # Use a copy to avoid thread issues
+        self.worker.moveToThread(self.thread)
+
+        # Connect signals
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.on_report_finished)
+        self.worker.error.connect(self.on_report_error)
+        
+        # Start the thread
+        self.thread.start()
+
+    def on_report_finished(self, report_path):
+        """Called when the report is successfully generated."""
+        QMessageBox.information(self, "Success", f"Report generated! Opening in your browser...")
+        webbrowser.open(f'file:///{os.path.realpath(report_path)}')
+        
+        # Clean up the thread
+        self.thread.quit()
+        self.thread.wait()
+        self.btn_generate_report.setEnabled(True)
+        self.btn_generate_report.setText("Generate Detailed Analysis Report")
+
+    def on_report_error(self, error_message):
+        """Called when report generation fails."""
+        QMessageBox.critical(self, "Error", f"Failed to generate report.\n\nError: {error_message}")
+        
+        # Clean up the thread
+        self.thread.quit()
+        self.thread.wait()
+        self.btn_generate_report.setEnabled(True)
+        self.btn_generate_report.setText("Generate Detailed Analysis Report") 
+
+    def apply_scaling(self):
+        if self.df is None:
+            return
+
+        selected_items = self.column_list_widget.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select one or more columns from the list on the left.")
+            return
+
+        selected_columns = [item.text() for item in selected_items]
+        method = self.scaling_method_selector.currentText()
+
+        numeric_cols = self.df[selected_columns].select_dtypes(include=np.number).columns.tolist()
+        non_numeric_cols = list(set(selected_columns) - set(numeric_cols))
+
+        if not numeric_cols:
+            QMessageBox.warning(self, "Warning", "Scaling can only be applied to numeric columns. No numeric columns were selected.")
+            return
+        
+        if non_numeric_cols:
+            QMessageBox.information(self, "Info", f"Scaling will only be applied to the following numeric columns:\n\n{', '.join(numeric_cols)}")
+
+        scaler_map = {
+            "StandardScaler": StandardScaler,
+            "MinMaxScaler": MinMaxScaler,
+            "RobustScaler": RobustScaler
+        }
+        scaler = scaler_map[method]()
+        
+        df_modified = self.df.copy()
+        plotter = Plotter(self.df)
+        changed_cols = []
+
+        for col in numeric_cols:
+            transformed_series = pd.Series(
+                scaler.fit_transform(self.df[[col]]).flatten(), 
+                index=self.df.index,
+                name=col
+            )
+            
+            is_accepted = plotter.plot_comparison(self.df[col], transformed_series, col)
+            if is_accepted:
+                df_modified[col] = transformed_series
+                changed_cols.append(col)
+
+        if not changed_cols:
+            QMessageBox.information(self, "Info", "No scaling changes were applied (or all were canceled).")
+            return
+            
+        self.df = df_modified
+        
+        self.operation_history.append({
+            'name': 'apply_scaling',
+            'columns': changed_cols,
+            'method': method
+        })
+
+        QMessageBox.information(self, "Success", f"{method} applied to {len(changed_cols)} columns.")
+        
+        self.update_data_preview()
+        self.update_eda_info() 
+
+    def on_column_selection_changed(self):
+        """Called when the user changes the column selection in the QListWidget."""
+        if self.df is None:
+            self.outlier_suggestion_label.setText("Suggestion: Select a numeric column to see recommendations.")
+            return
+
+        selected_items = self.column_list_widget.selectedItems()
+        
+        # We only provide suggestions for single-column selections for simplicity
+        if len(selected_items) == 1:
+            column_name = selected_items[0].text()
+            
+            # Check if the column is numeric
+            if pd.api.types.is_numeric_dtype(self.df[column_name]):
+                # Calculate skewness
+                skewness = self.df[column_name].skew()
+                
+                # Provide recommendation based on skewness
+                if abs(skewness) > 1:
+                    self.outlier_suggestion_label.setText(f"Suggestion: Skewness is {skewness:.2f}. Consider using IQR method as it's robust to skewed data.")
+                    self.outlier_suggestion_label.setVisible(True)
+                else:
+                    self.outlier_suggestion_label.setText(f"Suggestion: Skewness is {skewness:.2f}. Both methods can be suitable.")
+                    self.outlier_suggestion_label.setVisible(True)
+            else:
+                self.outlier_suggestion_label.setText("Suggestion: Selected column is not numeric.")
+                self.outlier_suggestion_label.setVisible(True)
+        else:
+            # Hide or reset suggestion if multiple or no columns are selected
+            self.outlier_suggestion_label.setText("Suggestion: Select a single numeric column to see recommendations.")
+
+    def apply_scaling(self):
+        if self.df is None:
+            return
+
+        selected_items = self.column_list_widget.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select one or more columns from the list on the left.")
+            return
+
+        selected_columns = [item.text() for item in selected_items]
+        method = self.scaling_method_selector.currentText()
+
+        numeric_cols = self.df[selected_columns].select_dtypes(include=np.number).columns.tolist()
+        non_numeric_cols = list(set(selected_columns) - set(numeric_cols))
+
+        if not numeric_cols:
+            QMessageBox.warning(self, "Warning", "Scaling can only be applied to numeric columns. No numeric columns were selected.")
+            return
+        
+        if non_numeric_cols:
+            QMessageBox.information(self, "Info", f"Scaling will only be applied to the following numeric columns:\n\n{', '.join(numeric_cols)}")
+
+        scaler_map = {
+            "StandardScaler": StandardScaler,
+            "MinMaxScaler": MinMaxScaler,
+            "RobustScaler": RobustScaler
+        }
+        scaler = scaler_map[method]()
+        
+        df_modified = self.df.copy()
+        plotter = Plotter(self.df)
+        changed_cols = []
+
+        for col in numeric_cols:
+            transformed_series = pd.Series(
+                scaler.fit_transform(self.df[[col]]).flatten(), 
+                index=self.df.index,
+                name=col
+            )
+            
+            is_accepted = plotter.plot_comparison(self.df[col], transformed_series, col)
+            if is_accepted:
+                df_modified[col] = transformed_series
+                changed_cols.append(col)
+
+        if not changed_cols:
+            QMessageBox.information(self, "Info", "No scaling changes were applied (or all were canceled).")
+            return
+            
+        self.df = df_modified
+        
+        self.operation_history.append({
+            'name': 'apply_scaling',
+            'columns': changed_cols,
+            'method': method
+        })
+
+        QMessageBox.information(self, "Success", f"{method} applied to {len(changed_cols)} columns.")
+        
+        self.update_data_preview()
+        self.update_eda_info() 

@@ -6,4 +6,6 @@ matplotlib
 seaborn
 mlxtend
 click
-openpyxl 
+openpyxl
+ydata-profiling
+category_encoders 

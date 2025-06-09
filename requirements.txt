@@ -1,0 +1,9 @@
+PyQt5
+scikit-learn
+pandas
+numpy
+matplotlib
+seaborn
+mlxtend
+click
+openpyxl 
